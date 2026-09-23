@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel><title>Synthetic engineering signals</title>
+  <item><guid>fixture://engineering/api-timeout-01</guid><title>Retries amplify API timeouts</title><description>A client retries every timeout immediately, which increases queue pressure during a partial outage. Adding bounded backoff and observing retry volume can keep recovery traffic from overwhelming the service.</description><pubDate>2026-05-01T10:00:00Z</pubDate><category>api reliability</category></item>
+  <item><guid>fixture://engineering/dependency-06</guid><title>Dependency updates need a repeatable check</title><description>Teams sometimes merge dependency changes without recording which integration checks ran. A small repeatable validation step makes the change easier to inspect and reproduce.</description><pubDate>2026-05-06T10:00:00Z</pubDate><category>engineering practice</category></item>
+  <item><guid>fixture://engineering/queue-07</guid><title>Queue backlog hides slow consumers</title><description>A growing backlog can come from consumer concurrency, slow downstream calls, or a traffic burst. Tracking age of the oldest item alongside queue size helps distinguish those conditions.</description><pubDate>2026-05-07T10:00:00Z</pubDate><category>automation</category></item>
+</channel></rss>
