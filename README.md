@@ -67,6 +67,8 @@ Unchanged reruns report executed and reused stage counts. The proof shows avoide
 ## 60-second demo
 
 ```sh
+git clone https://github.com/vantablade-ai/signal-to-content-automation-pipeline.git
+cd signal-to-content-automation-pipeline
 make install
 make demo
 ```
