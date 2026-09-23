@@ -1,3 +1,4 @@
+import hashlib
 import json
 import wave
 from pathlib import Path
@@ -62,6 +63,67 @@ def test_unchanged_run_reuses_every_stage(tmp_path):
     manifest = json.loads((tmp_path / "test/manifest.json").read_text())
     assert all(rec["status"] == "SUCCEEDED" for rec in manifest["stage_records"].values())
     assert all(a["sha256"] for a in manifest["artifacts"].values())
+
+
+def test_cached_ingest_and_normalize_skip_transformations(tmp_path, monkeypatch):
+    run(tmp_path).run()
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("cached stage transformation should not execute")
+
+    monkeypatch.setattr(JsonFixtureSource, "load", unexpected)
+    monkeypatch.setattr(RSSFixtureSource, "load", unexpected)
+    monkeypatch.setattr("app.pipeline.normalize", unexpected)
+    result = run(tmp_path).run()
+    assert result["executed"] == 0
+    assert result["reused"] == len(STAGES)
+
+
+def test_prior_success_then_rank_failure_blocks_and_discards_descendants(tmp_path, monkeypatch):
+    run(tmp_path).run()
+    monkeypatch.setattr("app.pipeline.render", lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("stale media must not be rendered")))
+
+    result = run(tmp_path, provider=MockContentProvider("error")).run()
+    manifest = json.loads((tmp_path / "test/manifest.json").read_text())
+    records = manifest["stage_records"]
+    assert result["completion_state"] == "INCOMPLETE"
+    assert records["RANK"]["status"] == "FAILED"
+    assert records["BRIEF"]["status"] == "BLOCKED"
+    for stage in ("SCRIPT", "TTS", "CAPTIONS", "RENDER", "PACKAGE"):
+        assert records[stage]["status"] == "BLOCKED"
+        assert records[stage]["output_artifacts"] == []
+    assert not any(item["producer_stage"] in {"BRIEF", "SCRIPT", "TTS", "CAPTIONS", "RENDER", "PACKAGE"}
+                   for item in manifest["artifacts"].values())
+    assert (tmp_path / "test/audio.wav").exists()  # retained on disk, but no longer active in the manifest
+
+
+def test_prior_success_then_zero_ranked_signals_blocks_descendants(tmp_path):
+    run(tmp_path).run()
+    empty_json = tmp_path / "empty.json"
+    empty_rss = tmp_path / "empty.xml"
+    empty_json.write_text("[]")
+    empty_rss.write_text("<rss><channel /></rss>")
+
+    result = Pipeline(tmp_path, "test", empty_json, empty_rss).run()
+    manifest = json.loads((tmp_path / "test/manifest.json").read_text())
+    records = manifest["stage_records"]
+    assert result["completion_state"] == "INCOMPLETE"
+    assert records["RANK"]["status"] == "SUCCEEDED"
+    assert json.loads((tmp_path / "test/rankings.json").read_text()) == []
+    for stage in ("BRIEF", "SCRIPT", "TTS", "CAPTIONS", "RENDER", "PACKAGE"):
+        assert records[stage]["status"] == "BLOCKED"
+        assert records[stage]["output_artifacts"] == []
+
+
+def test_rebuilt_artifacts_all_match_their_current_files(tmp_path):
+    run(tmp_path).run()
+    run(tmp_path, stage_configurations={"SCRIPT": {"prompt_revision": "v2"}}).run()
+    manifest = json.loads((tmp_path / "test/manifest.json").read_text())
+    for artifact in manifest["artifacts"].values():
+        path = tmp_path / "test" / artifact["path"]
+        assert path.is_file()
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == artifact["sha256"]
 
 
 def test_render_failure_resume_preserves_upstream(tmp_path):
@@ -150,7 +212,7 @@ def test_audio_caption_and_package_artifacts(tmp_path):
 
 
 def test_explicit_ffmpeg_unavailable_is_bounded(tmp_path, monkeypatch):
-    monkeypatch.setattr("app.pipeline.shutil.which", lambda _: None)
+    monkeypatch.setattr("app.media.shutil.which", lambda _: None)
     result = run(tmp_path, renderer="ffmpeg").run()
     assert result["completion_state"] == "INCOMPLETE"
     manifest = json.loads((tmp_path / "test/manifest.json").read_text())

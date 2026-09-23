@@ -2,15 +2,12 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
-import struct
-import subprocess
-import wave
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from app.hashing import canonical_json, fingerprint, sha256_bytes
+from app.media import captions, make_wav, render
 from app.models import (
     ArtifactRecord,
     ContentBrief,
@@ -22,6 +19,7 @@ from app.models import (
     StageRecord,
     StageStatus,
 )
+from app.providers.base import ContentProvider
 from app.providers.mock import MockContentProvider
 from app.sources import JsonFixtureSource, RSSFixtureSource
 
@@ -124,7 +122,7 @@ def deduplicate(signals: list[Signal]) -> dict[str, Any]:
             "duplicates": duplicates, "exclusions": exclusions}
 
 
-def rank_signals(signals: list[Signal], provider: MockContentProvider) -> list[RankedCandidate]:
+def rank_signals(signals: list[Signal], provider: ContentProvider) -> list[RankedCandidate]:
     results = []
     for signal in signals:
         classification = provider.classify(signal)
@@ -142,7 +140,7 @@ class Pipeline:
     """Filesystem-backed deterministic runner. All provenance hashes are integrity/cache keys."""
 
     def __init__(self, runs_dir: Path, run_id: str, json_source: Path, rss_source: Path,
-                 provider: MockContentProvider | None = None, renderer: str = "mock",
+                 provider: ContentProvider | None = None, renderer: str = "mock",
                  render_config: dict[str, Any] | None = None, fail_render_once: bool = False,
                  stage_configurations: dict[str, dict[str, Any]] | None = None):
         self.root = runs_dir / run_id
@@ -175,11 +173,29 @@ class Pipeline:
         self.manifest.updated_at = utc_now()
         atomic_json(self.manifest_path, self.manifest.model_dump(mode="json"))
 
-    def _source_payload(self) -> tuple[list[dict[str, Any]], list[Signal]]:
-        raw = [r.model_dump(mode="json") for source in
-               (JsonFixtureSource(self.json_source), RSSFixtureSource(self.rss_source))
-               for r in source.load()]
-        return raw, [normalize(row) for row in raw]
+    def _source_payload(self) -> list[dict[str, Any]]:
+        return [r.model_dump(mode="json") for source in
+                (JsonFixtureSource(self.json_source), RSSFixtureSource(self.rss_source))
+                for r in source.load()]
+
+    def _discard_stage_artifacts(self, stage: str) -> None:
+        stale = [artifact_id for artifact_id, artifact in self.manifest.artifacts.items()
+                 if artifact.producer_stage == stage]
+        for artifact_id in stale:
+            self.manifest.artifacts.pop(artifact_id, None)
+        self.manifest.stage_records[stage].output_artifacts = []
+
+    def _block_stage(self, stage: str, blocked_by: list[str], message: str) -> None:
+        rec = self.manifest.stage_records[stage]
+        self._discard_stage_artifacts(stage)
+        rec.status, rec.blocked_by = StageStatus.BLOCKED, blocked_by
+        rec.error = {"type": "dependency_unavailable", "message": message}
+        rec.fingerprint = ""
+        rec.input_artifacts = []
+        rec.provider = rec.provider_version = None
+        rec.reused = False
+        rec.finished_at = utc_now()
+        self._save()
 
     def _dependency_hashes(self, stage: str) -> dict[str, str]:
         out = {}
@@ -209,9 +225,7 @@ class Pipeline:
         blocked = [dep for dep in deps if self.manifest.stage_records[dep].status not in
                    {StageStatus.SUCCEEDED}]
         if blocked:
-            rec.status, rec.blocked_by = StageStatus.BLOCKED, blocked
-            rec.error = {"type": "dependency_unavailable", "message": ",".join(blocked)}
-            self._save()
+            self._block_stage(stage, blocked, ",".join(blocked))
             return None
         config = {"stage": config, "stage_configuration": self.stage_configurations.get(stage, {})}
         fp = self._fingerprint(stage, config)
@@ -225,6 +239,7 @@ class Pipeline:
             self._save()
             print(f"[{stage}] REUSED")
             return result
+        self._discard_stage_artifacts(stage)
         rec.status, rec.fingerprint = StageStatus.RUNNING, fp
         rec.started_at, rec.finished_at = utc_now(), None
         rec.error, rec.blocked_by, rec.reused = None, [], False
@@ -267,6 +282,7 @@ class Pipeline:
             print(f"[{stage}] SUCCEEDED")
             return result
         except Exception as exc:  # noqa: BLE001 - a stage boundary must persist any provider/tool failure
+            self._discard_stage_artifacts(stage)
             rec.status, rec.finished_at = StageStatus.FAILED, utc_now()
             rec.error = {"type": type(exc).__name__, "message": str(exc)[:500]}
             self.manifest.failures.append({"stage": stage, **rec.error})
@@ -284,67 +300,52 @@ class Pipeline:
 
     def run(self) -> dict[str, Any]:
         self._init()
+        self.manifest.selected_signal_id = None
         raw_config = {"json": {"path": str(self.json_source), "sha256": sha256_bytes(self.json_source.read_bytes())},
                       "rss": {"path": str(self.rss_source), "sha256": sha256_bytes(self.rss_source.read_bytes())}}
         self.manifest.source_configuration = raw_config
         provider_settings = {"name": self.provider.name, "version": self.provider.version,
                              "behavior": getattr(self.provider, "behavior", "default")}
         self.manifest.provider_metadata = provider_settings
-        raw, normalized = self._source_payload()
-        ingest = self._run_stage("INGEST", raw_config, lambda: raw, artifact_type="raw_signals")
-        if ingest is None: ingest = raw if self.manifest.stage_records["INGEST"].status == StageStatus.SUCCEEDED else None
-        normalized_dump = [s.model_dump(mode="json") for s in normalized]
-        norm = self._run_stage("NORMALIZE", {"normalizer": "1.0"}, lambda: normalized_dump,
-                               artifact_type="canonical_signals")
-        if norm is None and self.manifest.stage_records["NORMALIZE"].status == StageStatus.SUCCEEDED: norm = self._read_stage("NORMALIZE")
+        ingest = self._run_stage("INGEST", raw_config, self._source_payload, artifact_type="raw_signals")
+        norm = self._run_stage("NORMALIZE", {"normalizer": "1.0"},
+            lambda: [normalize(row).model_dump(mode="json") for row in (ingest or [])],
+            artifact_type="canonical_signals")
         norm_signals = [Signal.model_validate(x) for x in (norm or [])]
         dedup = self._run_stage("DEDUPLICATE", {"min_body_chars": 35, "algorithm": "exact-v1"},
                                 lambda: deduplicate(norm_signals), artifact_type="deduplication_report")
-        if dedup is None and self.manifest.stage_records["DEDUPLICATE"].status == StageStatus.SUCCEEDED: dedup = self._read_stage("DEDUPLICATE")
         kept = [Signal.model_validate(x) for x in (dedup or {}).get("kept", [])]
         rank_cfg = {"weights": [0.35, 0.30, 0.25, 0.10], **provider_settings}
         ranked = self._run_stage("RANK", rank_cfg,
              lambda: [r.model_dump(mode="json") for r in rank_signals(kept, self.provider)],
              artifact_type="rankings")
-        if ranked is None and self.manifest.stage_records["RANK"].status == StageStatus.SUCCEEDED: ranked = self._read_stage("RANK")
-        rankings = [RankedCandidate.model_validate(x) for x in (ranked or [])]
+        rankings = [RankedCandidate.model_validate(x) for x in ranked] if ranked is not None else None
+        selected = rankings[0].signal_id if rankings else None
+        self.manifest.selected_signal_id = selected
         if rankings:
-            selected = rankings[0].signal_id
-            self.manifest.selected_signal_id = selected
             signal = next(s for s in kept if s.signal_id == selected)
             brief = self._run_stage("BRIEF", {**provider_settings, "selected_signal": selected},
                 lambda: self.provider.build_brief(signal, rankings[0].classification).model_dump(mode="json"), artifact_type="brief")
-            if brief is None and self.manifest.stage_records["BRIEF"].status == StageStatus.SUCCEEDED: brief = self._read_stage("BRIEF")
-        else:
+        elif rankings is not None:
+            self._block_stage("BRIEF", ["RANK"], "no ranked signals")
             brief = None
-            self.manifest.stage_records["BRIEF"].status = StageStatus.BLOCKED
-            self.manifest.stage_records["BRIEF"].blocked_by = ["RANK"]
-        brief_model = ContentBrief.model_validate(brief) if brief else None
-        script = self._run_stage("SCRIPT", provider_settings,
-            lambda: self.provider.build_script(brief_model).model_dump(mode="json"), artifact_type="script") if brief_model else None
-        if script is None and self.manifest.stage_records["SCRIPT"].status == StageStatus.SUCCEEDED: script = self._read_stage("SCRIPT")
-        script_model = ScriptArtifact.model_validate(script) if script else None
-        audio = self._run_stage("TTS", {"tts": "synthetic-tone-v1", "sample_rate": 8000},
-            lambda: self._make_wav(script_model.estimated_duration_seconds), artifact_type="synthetic_audio", media_type="audio/wav") if script_model else None
-        captions = self._run_stage("CAPTIONS", {"captioner": "deterministic-srt-v1"},
-            lambda: self._captions(script_model), artifact_type="captions", media_type="application/x-subrip") if script_model else None
-        if captions is None and self.manifest.stage_records["CAPTIONS"].status == StageStatus.SUCCEEDED: captions = self._read_stage("CAPTIONS")
-        if audio is None and self.manifest.stage_records["TTS"].status == StageStatus.SUCCEEDED: audio = self._read_stage("TTS")
-        render_config = {"renderer": self.renderer, **self.render_config}
-        render = self._run_stage("RENDER", render_config,
-            lambda: self._render(audio, captions), artifact_type="render_descriptor", media_type="application/json") if audio is not None and captions is not None else None
-        if render is None:
-            render_record = self.manifest.stage_records["RENDER"]
-            if render_record.status != StageStatus.FAILED:
-                render_record.status = StageStatus.BLOCKED
-                render_record.blocked_by = ["TTS", "CAPTIONS"]
-            package_record = self.manifest.stage_records["PACKAGE"]
-            package_record.status = StageStatus.BLOCKED
-            package_record.blocked_by = ["RENDER"]
-            self._save()
         else:
-            self._run_stage("PACKAGE", {"package_schema": "1.0"},
-                lambda: self._package(selected if rankings else None), artifact_type="package")
+            brief = self._run_stage("BRIEF", {**provider_settings, "selected_signal": None},
+                dict, artifact_type="brief")
+        brief_model = ContentBrief.model_validate(brief) if brief is not None else None
+        script = self._run_stage("SCRIPT", provider_settings,
+            lambda: self.provider.build_script(brief_model).model_dump(mode="json"), artifact_type="script")
+        script_model = ScriptArtifact.model_validate(script) if script is not None else None
+        audio = self._run_stage("TTS", {"tts": "synthetic-tone-v1", "sample_rate": 8000},
+            lambda: make_wav(script_model.estimated_duration_seconds), artifact_type="synthetic_audio", media_type="audio/wav")
+        caption_result = self._run_stage("CAPTIONS", {"captioner": "deterministic-srt-v1"},
+            lambda: captions(script_model), artifact_type="captions", media_type="application/x-subrip")
+        render_config = {"renderer": self.renderer, **self.render_config}
+        self._run_stage("RENDER", render_config,
+            lambda: render(self.root, self.renderer, self.fail_render_once, audio, caption_result),
+            artifact_type="render_descriptor", media_type="application/json")
+        self._run_stage("PACKAGE", {"package_schema": "1.0"},
+            lambda: self._package(selected), artifact_type="package")
         for stage in STAGES:
             rec = self.manifest.stage_records[stage]
             unavailable = [dep for dep in DEPENDENCIES[stage]
@@ -360,58 +361,6 @@ class Pipeline:
         return {"executed": self.executed, "reused": self.reused, "artifacts_created": self.created,
                 "completion_state": self.manifest.completion_state, "selected_signal_id": self.manifest.selected_signal_id,
                 "duplicates": len((dedup or {}).get("duplicates", []))}
-
-    @staticmethod
-    def _make_wav(duration: int) -> bytes:
-        rate, count = 8000, duration * 8000
-        import io
-        output = io.BytesIO()
-        with wave.open(output, "wb") as wav:
-            wav.setnchannels(1); wav.setsampwidth(2); wav.setframerate(rate)
-            wav.writeframes(b"".join(struct.pack("<h", 700 if (i // 80) % 2 else -700) for i in range(count)))
-        return output.getvalue()
-
-    @staticmethod
-    def _captions(script: ScriptArtifact) -> str:
-        words = script.caption_text.split()
-        chunks = [" ".join(words[i:i + 8]) for i in range(0, len(words), 8)]
-        duration = script.estimated_duration_seconds
-        rows = []
-        for i, text in enumerate(chunks):
-            start = duration * i / len(chunks)
-            end = duration * (i + 1) / len(chunks)
-            rows.append(f"{i + 1}\n{Pipeline._srt_time(start)} --> {Pipeline._srt_time(end)}\n{text}")
-        return "\n\n".join(rows) + "\n"
-
-    @staticmethod
-    def _srt_time(seconds: float) -> str:
-        ms = round(seconds * 1000)
-        h, ms = divmod(ms, 3_600_000); m, ms = divmod(ms, 60_000); s, ms = divmod(ms, 1000)
-        return f"{h:02}:{m:02}:{s:02},{ms:03}"
-
-    def _render(self, audio: bytes, captions: str) -> dict[str, Any]:
-        if self.fail_render_once:
-            marker = self.root / ".render-failed-once"
-            if not marker.exists():
-                atomic_bytes(marker, b"failed")
-                raise RuntimeError("simulated render failure")
-        if self.renderer == "mock":
-            return {"renderer": "mock", "label": "synthetic placeholder", "audio_sha256": sha256_bytes(audio),
-                    "caption_sha256": sha256_bytes(captions.encode()), "container": "json-placeholder"}
-        if self.renderer != "ffmpeg":
-            raise ValueError("renderer must be mock or ffmpeg")
-        executable = shutil.which("ffmpeg")
-        if not executable:
-            raise RuntimeError("FFmpeg unavailable: install ffmpeg or select --renderer mock")
-        wav_path, mp4_path = self.root / "audio.wav", self.root / "final.mp4"
-        proc = subprocess.run([executable, "-y", "-f", "lavfi", "-i", "color=c=0x182433:s=640x360:r=24",
-             "-i", str(wav_path), "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p",
-             "-c:a", "aac", str(mp4_path)], capture_output=True, text=True, check=False)
-        if proc.returncode or not mp4_path.is_file():
-            raise RuntimeError(f"FFmpeg exit={proc.returncode}: {proc.stderr[-300:]}")
-        payload = mp4_path.read_bytes()
-        return {"renderer": "ffmpeg", "path": "final.mp4", "sha256": sha256_bytes(payload),
-                "exit_code": proc.returncode, "stdout": proc.stdout[-300:], "stderr": proc.stderr[-300:]}
 
     def _package(self, selected: str | None) -> dict[str, Any]:
         refs = {}
