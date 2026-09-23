@@ -1,6 +1,6 @@
-![CI](https://github.com/vantablade-ai/signal-to-content-automation-pipeline/actions/workflows/ci.yml/badge.svg)
-
 # Signal-to-Content Automation Pipeline
+
+![CI](https://github.com/vantablade-ai/signal-to-content-automation-pipeline/actions/workflows/ci.yml/badge.svg)
 
 CI runs Ruff, compileall, and the offline pytest suite on pushes and pull requests.
 
